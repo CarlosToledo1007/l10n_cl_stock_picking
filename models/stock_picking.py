@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
+from datetime import date, datetime
 from openerp import osv, models, fields, api, _, SUPERUSER_ID
 from openerp.osv import fields as old_fields
 from openerp.exceptions import except_orm, UserError
 import openerp.addons.decimal_precision as dp
 from openerp.tools.float_utils import float_compare, float_round
+from openerp.tools import DEFAULT_SERVER_DATETIME_FORMAT, DEFAULT_SERVER_DATE_FORMAT
 import logging
 _logger = logging.getLogger(__name__)
 
@@ -70,15 +72,20 @@ class StockPicking(models.Model):
     amount_total = fields.Monetary(compute='_compute_amount',
         digits_compute=dp.get_precision('Account'),
         string='Total')
-    currency_id = fields.Many2one('res.currency', string='Currency',
-        required=True, readonly=True, states={'draft': [('readonly', False)]},
+    currency_id = fields.Many2one(
+        'res.currency',
+        string='Currency',
+        required=True,
+        readonly=True,
+        states={'draft': [('readonly', False)]},
         default=lambda self: self.env.user.company_id.currency_id,
         track_visibility='always')
     sii_batch_number = fields.Integer(
         copy=False,
         string='Batch Number',
         readonly=True,
-        help='Batch number for processing multiple invoices together')
+        help='Batch number for processing multiple invoices together',
+    )
     turn_issuer = fields.Many2one(
         'partner.activities',
         'Giro Emisor',
@@ -154,6 +161,10 @@ class StockPicking(models.Model):
         string="Contacto",
         readonly=False,
         states={'done':[('readonly',True)]})
+    invoiced = fields.Boolean(
+        string='Invoiced?',
+        readonly=True,
+    )
 
     def onchange_picking_type(self, cr, uid, ids, picking_type_id, partner_id, context=None):
         res = super(StockPicking, self).onchange_picking_type(cr, uid, ids, picking_type_id, partner_id, context=context)
@@ -184,7 +195,7 @@ class StockPicking(models.Model):
                 for m in rec.pack_operation_product_ids:
                     for l in rec.move_lines_related:
                         if l.product_id.id == m.product_id.id:
-                            m.price_unit = l.price_unit
+                            m.price_unit = l.price_unit_sales
                             m.discount = l.discount
                             m.operation_line_tax_ids = l.move_line_tax_ids
                 if not m.price_unit > 0 or not m.name:
@@ -342,12 +353,12 @@ class StockPicking(models.Model):
                 move_quants = move.reserved_quant_ids
                 quant_obj = self.pool.get('stock.quant')
                 for mq in move_quants:
-                    quant_obj.write(cr, SUPERUSER_ID, mq.id, {'price_unit': move.price_unit, 'name': move.name}, context=context)
+                    quant_obj.write(cr, SUPERUSER_ID, mq.id, {'price_unit': move.price_unit_sales, 'name': move.name}, context=context)
                 picking_quants += move_quants
                 forced_qty = (move.state == 'assigned') and move.product_qty - sum([x.qty for x in move_quants]) or 0
                 #if we used force_assign() on the move, or if the move is incoming, forced_qty > 0
                 if float_compare(forced_qty, 0, precision_rounding=move.product_id.uom_id.rounding) > 0:
-                    forced_qties.extend([{'key':move.product_id,'value': forced_qty, 'name' : move.name ,'price_unit': move.price_unit}])
+                    forced_qties.extend([{'key':move.product_id,'value': forced_qty, 'name' : move.name ,'price_unit': move.price_unit_sales}])
             for vals in self._prepare_pack_ops(cr, uid, picking, picking_quants, forced_qties, context=context):
                 vals['fresh_record'] = False
                 pack_operation_obj.create(cr, uid, vals, context=context)
@@ -385,9 +396,8 @@ class StockPackOperation(models.Model):
             if vals['product_id'] == o.product_id.id and o.name == vals['name']:
                 vals['subtotal'] = o.subtotal
                 vals['discount'] = o.discount
-                vals['operation_line_tax_ids'] = o.move_line_tax_ids.ids
-
-        super(StockPackOperation,self).create(cr,uid,vals,context=context)
+                vals['operation_line_tax_ids'] = [(6, 0, o.move_line_tax_ids.ids)]
+        super(StockPackOperation,self).create( cr, uid, vals, context=context)
 
     @api.depends('picking_id.move_lines_related')
     @api.onchange('name', 'qty_done')
@@ -395,7 +405,7 @@ class StockPackOperation(models.Model):
         for rec in self:
             for l in rec.picking_id.move_lines_related:
                 if l.product_id.id == rec.product_id.id and l.name == rec.name:
-                    rec.price_unit = l.price_unit
+                    rec.price_unit = l.price_unit_sales
                     rec.discount = l.discount
                     rec.operation_line_tax_ids = l.move_line_tax_ids
             if not rec.price_unit > 0 or not rec.name:
@@ -405,22 +415,42 @@ class StockPackOperation(models.Model):
                 rec.operation_line_tax_ids = rec.product_id.taxes_id # @TODO mejorar asignación
 
     name = fields.Char(string="Nombre")
-
     subtotal = fields.Monetary(
-        compute='_compute_amount', digits_compute=dp.get_precision('Account'),
+        compute='_compute_amount',
+        digits_compute=dp.get_precision('Account'),
         string='Subtotal')
-    price_unit = fields.Monetary(digits_compute=dp.get_precision('Product Price'),
-                                   string='Price')
-    price_untaxed = fields.Monetary( digits_compute=dp.get_precision('Product Price'),
-        string='Price Untaxed')
-
-    operation_line_tax_ids = fields.Many2many('account.tax',
-        'operation_line_tax', 'operation_line_id', 'tax_id',
-            string='Taxes', domain=[('type_tax_use','!=','none'), '|', ('active', '=', False), ('active', '=', True)], oldname='invoice_line_tax_id')
-    discount = fields.Monetary(digits_compute=dp.get_precision('Discount'),
-                                 string='Discount (%)')
-    currency_id = fields.Many2one('res.currency', string='Currency',
-        required=True, readonly=True, states={'draft': [('readonly', False)]},
+    price_unit = fields.Monetary(
+        digits_compute=dp.get_precision('Product Price'),
+        string='Price',
+    )
+    price_untaxed = fields.Monetary(
+        digits_compute=dp.get_precision('Product Price'),
+        string='Price Untaxed',
+    )
+    operation_line_tax_ids = fields.Many2many(
+        'account.tax',
+        'operation_line_tax',
+        'operation_line_id',
+        'tax_id',
+        string='Taxes',
+        domain=[
+            ('type_tax_use','!=','none'),
+            '|',
+            ('active', '=', False),
+            ('active', '=', True)
+        ],
+        oldname='invoice_line_tax_id'
+    )
+    discount = fields.Monetary(
+        digits_compute=dp.get_precision('Discount'),
+        string='Discount (%)',
+    )
+    currency_id = fields.Many2one(
+        'res.currency',
+        string='Currency',
+        required=True,
+        readonly=True,
+        states={'draft': [('readonly', False)]},
         default=lambda self: self.env.user.company_id.currency_id,
         track_visibility='always')
 
@@ -450,12 +480,12 @@ class StockMove(models.Model):
                         inv = self.env['account.invoice'].search([('sii_document_number','=',ref.origen)])
                         for l in inv.invoice_lines:
                             if l.product_id.id == rec.product_id.id:
-                                rec.price_unit = l.price_unit
+                                rec.price_unit_sales = l.price_unit
                                 rec.subtotal = l.subtotal
                                 rec.discount = l.discount
                                 rec.move_line_tax_ids = l.invoice_line_tax_ids
-            if not rec.price_unit > 0 or not rec.name:
-                rec.price_unit = rec.product_id.lst_price
+            if not rec.price_unit_sales > 0 or not rec.name:
+                rec.price_unit_sales = rec.product_id.lst_price
                 if not rec.name:
                 	rec.name = rec.product_id.name
                 rec.move_line_tax_ids = rec.product_id.taxes_id # @TODO mejorar asignación
@@ -463,7 +493,7 @@ class StockMove(models.Model):
     @api.onchange('name','product_id','move_line_tax_ids','product_uom_qty')
     def _compute_amount(self):
         for rec in self:
-            price = rec.price_unit * (1 - (rec.discount or 0.0) / 100.0)
+            price = rec.price_unit_sales * (1 - (rec.discount or 0.0) / 100.0)
             rec.subtotal = rec.product_uom_qty * price
 
     name = fields.Char(string="Nombre")
@@ -472,23 +502,35 @@ class StockMove(models.Model):
         compute='_compute_amount', digits_compute=dp.get_precision('Product Price'),
         string='Subtotal')
 
-    price_unit = fields.Monetary( digits_compute=dp.get_precision('Product Price'),
-                                   string='Price')
+    price_unit_sales = fields.Monetary(
+        digits_compute=dp.get_precision('Product Price'),
+        string='Price',
+    )
     price_untaxed = fields.Monetary(
-        compute='_sale_prices', digits_compute=dp.get_precision('Product Price'),
-        string='Price Untaxed')
-
-    move_line_tax_ids = fields.Many2many('account.tax',
-        'move_line_tax_ids', 'move_line_id', 'tax_id',
-            string='Taxes', domain=[('type_tax_use','!=','none'), '|', ('active', '=', False), ('active', '=', True)], oldname='invoice_line_tax_id')
-
-    discount = fields.Monetary(digits_compute=dp.get_precision('Discount'),
-                                 string='Discount (%)')
+        compute='_sale_prices',
+        digits_compute=dp.get_precision('Product Price'),
+        string='Price Untaxed',
+    )
+    move_line_tax_ids = fields.Many2many(
+        'account.tax',
+        'move_line_tax_ids',
+        'move_line_id',
+        'tax_id',
+        string='Taxes',
+        domain=[('type_tax_use','!=','none'), '|', ('active', '=', False), ('active', '=', True)],
+        oldname='invoice_line_tax_id',
+    )
+    discount = fields.Monetary(
+        digits_compute=dp.get_precision('Discount'),
+        string='Discount (%)',
+    )
     currency_id = fields.Many2one('res.currency', string='Currency',
         required=True,
-        readonly=True, states={'draft': [('readonly', False)]},
+        readonly=True,
+        states={'draft': [('readonly', False)]},
         default=lambda self: self.env.user.company_id.currency_id,
-        track_visibility='always')
+        track_visibility='always',
+    )
 
 class MQ(models.Model):
     _inherit = 'stock.quant'
@@ -496,14 +538,31 @@ class MQ(models.Model):
     description = fields.Char(
         string="Description",
     )
-    price_unit = fields.Monetary( digits_compute=dp.get_precision('Product Price'),
-                                   string='Price')
+    price_unit = fields.Monetary(
+        digits_compute=dp.get_precision('Product Price'),
+        string='Price',
+    )
     currency_id = fields.Many2one('res.currency',
         string='Currency',
         required=True,
         readonly=True,
         default=lambda self: self.env.user.company_id.currency_id,
-        track_visibility='always')
+        track_visibility='always'
+    )
+    quant_line_tax_ids = fields.Many2many(
+        'account.tax',
+        'quant_line_tax_ids',
+        'quant_line_id',
+        'tax_id',
+        string='Taxes',
+        domain=[
+            ('type_tax_use','!=','none'),
+            '|',
+            ('active', '=', False),
+            ('active', '=', True)
+        ],
+        oldname='invoice_line_tax_id',
+    )
 
     def _quant_create(self, cr, uid, qty, move, lot_id=False, owner_id=False, src_package_id=False, dest_package_id=False,
                       force_location_from=False, force_location_to=False, context=None):
@@ -526,8 +585,9 @@ class MQ(models.Model):
             'owner_id': owner_id,
             'package_id': dest_package_id,
             'description': move.name,
-            'price_unit': move.price_unit,
-            'currency_id': move.currency_id,
+            'price_unit': move.price_unit_sales,
+            'currency_id': move.currency_id.id,
+            'quant_line_tax_ids': [( 6, 0, move.move_line_tax_ids.ids )],
         }
         if move.location_id.usage == 'internal':
             #if we were trying to move something from an internal location and reach here (quant creation),

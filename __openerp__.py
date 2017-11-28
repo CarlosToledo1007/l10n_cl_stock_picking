@@ -29,7 +29,8 @@
         'views/stock_picking.xml',
         'views/layout.xml',
         'views/libro_guias.xml',
+        "views/account_invoice.xml",
         'wizard/masive_send_dte.xml',
     ],
-    'version': '9.0.4.4',
+    'version': '9.0.6.0',
 }
